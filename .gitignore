@@ -1,0 +1,47 @@
+# ── Folders to exclude ────────────────────────────────────────
+data/
+v1_Model/
+backend/chroma_store/
+backend/offline_embeddings/
+backend/venv/
+
+# ── Environment variables ──────────────────────────────────────
+.env
+backend/.env
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.egg-info/
+dist/
+build/
+*.egg
+.Python
+
+# ── Node / Frontend ───────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env.production
+
+# ── OS files ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+
+# ── Docker ────────────────────────────────────────────────────
+backend/venv/
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
+logs/

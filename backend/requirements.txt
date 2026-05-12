@@ -1,0 +1,21 @@
+# Core utilities
+requests
+tqdm
+python-dotenv
+
+# ML & embeddings
+numpy
+
+# Vector database
+qdrant-client
+
+# LLM
+google-generativeai
+
+# Caching / storage
+redis
+
+# Backend (FastAPI)
+fastapi
+uvicorn[standard]
+pydantic
