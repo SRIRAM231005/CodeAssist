@@ -1,4 +1,4 @@
-# 🧠 CodeAssist
+# CodeAssist
 
 > AI-powered repository-aware debugging system that analyzes dependency relationships across files instead of isolated code snippets.
 
@@ -8,194 +8,57 @@
 
 ---
 
-## What is CodeAssist?
+## 1. What is CodeAssist?
 
-CodeAssist is a deep code debugging platform that takes a GitHub repository, a file path, and a natural language query, then recursively traverses dependency relationships across the codebase to identify potential bugs, explain their causes, and generate structured debugging insights.
+CodeAssist is a repository-aware AI debugging platform. Give it a GitHub repo, a file path, and a plain-English bug description — it traces the actual dependency chain and returns a structured root-cause report.
 
-Unlike traditional linters or autocomplete-based AI assistants that only inspect the code directly provided to them, CodeAssist performs AST-based dependency traversal across interconnected functions and files, combining semantic retrieval with LLM-guided analysis.
-
-The system generates:
-- Structured bug reports
-- Dependency-aware debugging insights
-- Suggested fixes
-- Syntax-highlighted code snippets
-- Visual dependency graphs
-- Real-time streamed analysis logs
+- **Cross-file knowledge graph** — an AST-based engine builds a function-call graph across files, so the LLM reasons with context accumulated across every path it has already investigated, not just the one function in front of it
+- **Dual-path retrieval** — CodeBERT resolves the traversal entry point (anchor-function + line-chunk matching), while Qdrant retrieves top-k similar bug patterns to ground the LLM's hypothesis before it goes deep
+- **AST-hash caching** — Redis caches LLM analysis per structural hash, so unchanged code across traversal branches is never re-analyzed
+- **AI observability** — every traversal step, cache hit/miss, and routing decision streams live to the frontend over WebSocket, so the reasoning is visible in real time, not just the final answer
+- **Lightweight deployment** — embedding generation runs on a separate microservice, cutting the backend's Docker image from 2 GB to 500 MB
 
 ---
 
-## Demo
+## 2. Demo
 
-> Enter a GitHub repository URL, a Python file path, and describe the issue in plain English. CodeAssist handles traversal, retrieval, analysis, and report generation automatically.
-
----
-
-# How It Works
-
-## Request Lifecycle
-
-```text
-User Query + Repo URL + File Path
-        ↓
-POST /analyze → job_id
-        ↓
-WS /ws/{job_id}
-        ↓
-fetch file → AST → function extraction
-        ↓
-Gemini query parser → function match / chunker fallback
-        ↓
-CodeBERT embeddings + Qdrant retrieval → semantic context
-        ↓
-DecisionRouter → recursive AST traversal
-    → Redis cache lookup
-    → Gemini node analysis
-    → dependency expansion
-        ↓
-Gemini report generator
-        ↓
-WebSocket stream → Frontend
-```
+> Enter a GitHub repository URL, a Python file path, and describe the issue in plain English. CodeAssist handles entry-point discovery, traversal, retrieval, analysis, and report generation automatically — streaming progress live over WebSocket as it works.
 
 ---
 
-## Entry Point Discovery
+## 3. Tech Stack
 
-CodeAssist uses a two-stage fallback strategy to determine the traversal entry point.
-
-### 1. LLM-Based Entry
-
-The user query is parsed using Gemini to extract potential function names or bug targets. If a matching function exists, traversal begins from that function.
-
-### 2. Embedding-Based Fallback
-
-If no explicit function name is identified:
-
-* Function chunks are embedded using CodeBERT
-* Cosine similarity is computed against the user query
-* The highest similarity function becomes the traversal anchor
-
-Global line chunks such as:
-
-* constants
-* imports
-* standalone expressions
-* module-level assignments
-
-are also embedded independently.
-
-The most relevant line chunks are appended to the LLM context to capture data-level issues that pure AST traversal may miss.
+| Layer               | Technology              |
+| ------------------- | ------------------------ |
+| Frontend            | React, TypeScript, Vite |
+| Backend             | FastAPI, Python 3.12     |
+| Real-Time Streaming | WebSockets                |
+| LLM                 | Gemini 2.5 Flash          |
+| Embeddings          | CodeBERT                  |
+| Vector Database     | Qdrant Cloud               |
+| Cache               | Upstash Redis              |
+| Deployment          | Docker, Render, Vercel     |
+| Embedding Service   | Hugging Face Spaces        |
 
 ---
 
-## AST Traversal Engine
+## 4. Architecture & Flow Diagram
 
-Starting from the entry function, CodeAssist:
-
-* Extracts function source using Python AST parsing
-* Builds dependency relationships from function calls
-* Computes AST hashes for deduplication
-* Checks Redis cache before re-analysis
-* Sends each node to Gemini for reasoning
-* Expands traversal recursively through dependencies
-* Stops at configurable traversal depth limits
-
-This enables repository-aware debugging instead of isolated snippet analysis.
+![CodeAssist Analysis Pipeline](assets/architecture_flow_diagram.png)
 
 ---
 
-## Semantic Retrieval
-
-CodeAssist uses:
-
-* CodeBERT embeddings
-* Qdrant vector search
-* Function-level semantic retrieval
-* Context-aware chunk expansion
-
-to retrieve semantically relevant debugging context before LLM analysis.
-
----
-
-## Report Generation
-
-Once traversal completes, CodeAssist generates a structured markdown debugging report containing:
-
-* Bug explanation
-* Root cause analysis
-* Severity
-* Suggested fixes
-* Corrected code snippets
-* Dependency traversal summary
-
-Reports are streamed live through WebSockets and rendered with syntax highlighting in the frontend.
-
----
-
-# Architecture
-
-## System Overview
-
-```text
-Vercel                        Render 
-(React Frontend)  →       (FastAPI Backend)
-                                ↓
-                         Hugging Face Spaces
-                    (CodeBERT Embedder Service)
-                                ↓
-                 Qdrant Cloud | Upstash Redis | Gemini API
-                  (Vector DB)      (Cache)         (LLM)
-```
-
----
-
-## Backend Structure
-
-```text
-backend/
-  app/
-    main.py              # FastAPI app + HTTP/WebSocket endpoints
-
-  New_Model/
-    ast_engine.py        # AST parsing + dependency extraction
-    embedder.py          # CodeBERT embedder + Qdrant retriever
-    llm_analyzer.py      # Gemini orchestration layer
-    router.py            # Recursive traversal engine
-    redis_cache.py       # Redis caching layer
-    chunker.py           # Semantic chunk grouping pipeline
-
-  Dockerfile
-  requirements.txt
-```
-
----
-
-## Frontend Structure
-
-```text
-frontend/
-  src/
-    App.tsx
-    ChatLayout.tsx
-    Sidebar.tsx
-    App.css
-```
-
----
-
-## API Endpoints
+## 5. API Endpoints
 
 | Method | Endpoint       | Description                 |
-| ------ | -------------- | --------------------------- |
-| `POST` | `/analyze`     | Submit analysis request     |
-| `WS`   | `/ws/{job_id}` | Real-time streamed analysis |
-| `GET`  | `/health`      | Backend service health      |
-| `GET`  | `/cache/stats` | Redis cache statistics      |
-| `POST` | `/cache/clear` | Flush Redis cache           |
+| ------ | -------------- | ---------------------------- |
+| `POST` | `/analyze`     | Submit analysis request      |
+| `WS`   | `/ws/{job_id}` | Real-time streamed analysis  |
+| `GET`  | `/health`      | Backend service health       |
+| `GET`  | `/cache/stats` | Redis cache statistics       |
+| `POST` | `/cache/clear` | Flush Redis cache            |
 
----
-
-## WebSocket Message Types
+### WebSocket Message Types
 
 ```json
 { "type": "spinner", "message": "Fetching repository..." }
@@ -216,73 +79,18 @@ frontend/
 
 ---
 
-# Design Decisions
+## 6. Getting Started
 
-## Why AST Traversal Instead of Embeddings Alone?
+### Prerequisites
 
-Embedding-only retrieval often misses transitive dependency bugs spread across helper functions, utility layers, and nested call chains.
+- Python 3.12+
+- Node.js 18+
+- Docker
+- Gemini API key
+- Qdrant Cloud account
+- Upstash Redis account
 
-AST traversal enables repository-aware debugging by recursively following actual dependency relationships across files.
-
----
-
-## Why Externalize CodeBERT Into a Separate Microservice?
-
-Running CodeBERT directly inside the backend exceeded memory limits on low-cost deployment tiers.
-
-The embedding pipeline was isolated into a dedicated Hugging Face Spaces microservice to:
-
-* reduce backend memory usage
-* simplify deployment
-* preserve semantic retrieval quality
-
-Endpoint:
-https://sriramdev-codebert-api-space.hf.space/embed
-
----
-
-## Why Qdrant Instead of ChromaDB in Production?
-
-ChromaDB was initially used during local development.
-
-Qdrant Cloud was later adopted because it:
-
-* simplified deployment
-* avoided shipping persistent vector stores inside Docker images
-* provided managed cloud vector retrieval
-
----
-
-# Tech Stack
-
-| Layer               | Technology              |
-| ------------------- | ----------------------- |
-| Frontend            | React, TypeScript, Vite |
-| Backend             | FastAPI, Python 3.12    |
-| Real-Time Streaming | WebSockets              |
-| LLM                 | Gemini 2.5 Flash        |
-| Embeddings          | CodeBERT                |
-| Vector Database     | Qdrant Cloud            |
-| Cache               | Upstash Redis           |
-| Deployment          | Docker, Render, Vercel  |
-| Embedding Service   | Hugging Face Spaces     |
-
----
-
-# Getting Started
-
-## Prerequisites
-
-* Python 3.12+
-* Node.js 18+
-* Docker
-* Gemini API key
-* Qdrant Cloud account
-* Upstash Redis account
-
----
-
-## Backend Setup
+### Backend Setup
 
 ```bash
 cd backend
@@ -290,7 +98,7 @@ cd backend
 python -m venv venv
 
 # Windows
-venv\\Scripts\\activate
+venv\Scripts\activate
 
 # Linux / Mac
 source venv/bin/activate
@@ -322,9 +130,7 @@ Run backend:
 uvicorn app.main:app --reload
 ```
 
----
-
-## Frontend Setup
+### Frontend Setup
 
 ```bash
 cd frontend
@@ -339,9 +145,7 @@ Create `.env` inside `frontend/`:
 VITE_API_BASE=http://localhost:8000
 ```
 
----
-
-## Docker
+### Docker
 
 ```bash
 cd backend
@@ -360,20 +164,17 @@ docker run -p 8000:8000 \
 
 ---
 
-# Roadmap
+## 7. Roadmap
 
-* [ ] Multi-language support (JavaScript, Java, Go)
-* [ ] Hybrid traversal with branch-local stopping
-* [ ] Multi-bug detection across dependency branches
-* [ ] Runtime context injection (expected vs actual outputs)
-* [ ] Improved Top-K semantic entry-point retrieval
-* [ ] BugsInPy-based bug pattern grounding
+- [ ] Custom bug-pattern summary corpus — LLM-generated root-cause / trigger / fix-strategy summaries over Defectors (and similar) data, replacing raw code-similarity retrieval entirely
+- [ ] Multi-language support (JavaScript, Java, Go)
+- [ ] Smarter traversal with confidence-based branch pruning and early stopping
+- [ ] Multi-root-cause detection across independent dependency paths
+- [ ] Improved Top-K entry-point retrieval, blending anchor confidence with bug-pattern similarity
+- [ ] Redis job-ID storage migration from in-memory to TTL-based Redis expiry
 
 ---
 
-# Author
+## Author
 
-Sriram B
-
-```
-```
+B Sri Ram
