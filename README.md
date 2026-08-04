@@ -20,12 +20,6 @@ CodeAssist is a repository-aware AI debugging platform. Give it a GitHub repo, a
 
 ---
 
-## 2. Demo
-
-> Enter a GitHub repository URL, a Python file path, and describe the issue in plain English. CodeAssist handles entry-point discovery, traversal, retrieval, analysis, and report generation automatically — streaming progress live over WebSocket as it works.
-
----
-
 ## 3. Tech Stack
 
 | Layer               | Technology              |
