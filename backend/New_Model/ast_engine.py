@@ -21,53 +21,58 @@ def fetch_github_file(repo_url: str, file_path: str, branch: str = "main") -> st
         raise RuntimeError(f"GitHub request failed: {response.status_code}")
 
 
-def compute_ast_hash(code: str) -> str:
-    try:
-        tree = ast.parse(code)
-        return hashlib.sha256(ast.dump(tree).encode()).hexdigest()
-    except Exception:
-        return hashlib.sha256(code.encode()).hexdigest()
+from .adapters import get_adapter
 
 
-def extract_function_node(code: str, function_name: str) -> Optional[str]:
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return None
+def compute_ast_hash(code: str, file_path: str = "") -> str:
+    adapter = get_adapter(file_path)
+    return adapter.normalize_for_hash(code)
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == function_name:
-            return ast.get_source_segment(code, node)
-        if isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef):
-                    if item.name == function_name or f"{node.name}.{item.name}" == function_name:
-                        return ast.get_source_segment(code, item)
+
+def extract_function_node(code: str, function_name: str, file_path: str = "") -> Optional[str]:
+    adapter = get_adapter(file_path)
+    fns = adapter.extract_functions(code, file_path=file_path)
+    for fn in fns:
+        if fn.name == function_name:
+            return fn.code
+        # Match unqualified suffix
+        unqualified = fn.name.split("::")[-1].split(".")[-1]
+        if unqualified == function_name:
+            return fn.code
     return None
 
 
-def extract_all_functions(code: str) -> list:
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return []
-
-    functions = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            src = ast.get_source_segment(code, node)
-            if src:
-                functions.append({"name": node.name, "code": src})
-        elif isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef):
-                    src = ast.get_source_segment(code, item)
-                    if src:
-                        functions.append({"name": f"{node.name}.{item.name}", "code": src})
-    return functions
+def extract_all_functions(code: str, file_path: str = "") -> list:
+    adapter = get_adapter(file_path)
+    fns = adapter.extract_functions(code, file_path=file_path)
+    return [fn.to_dict() for fn in fns]
 
 
-def resolve_dependencies(code: str, function_name: str) -> dict:
+def resolve_dependencies(code: str, function_name: str, file_path: str = "") -> dict:
+    adapter = get_adapter(file_path)
+    if adapter.language_name in ("c", "cpp"):
+        all_fns = adapter.extract_functions(code, file_path=file_path)
+        defined_names = {f.name for f in all_fns} | {f.name.split("::")[-1] for f in all_fns}
+        target_fn = next((f for f in all_fns if f.name == function_name or f.name.split("::")[-1] == function_name), None)
+        if not target_fn:
+            return {"local_calls": [], "imported_calls": [], "imports_map": {}}
+
+        calls = adapter.extract_calls(target_fn.code, file_path=file_path)
+        local_calls = []
+        imported_calls = []
+        for call in calls:
+            callee = call.callee_name
+            if callee in defined_names and callee != function_name:
+                local_calls.append(callee)
+            else:
+                imported_calls.append({"name": callee, "module": "external", "is_resolved": call.is_resolved})
+
+        return {
+            "local_calls": list(set(local_calls)),
+            "imported_calls": imported_calls,
+            "imports_map": {},
+        }
+
     try:
         tree = ast.parse(code)
     except SyntaxError:

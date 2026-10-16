@@ -1,5 +1,6 @@
 import json
 import re
+from typing import Optional
 import google.generativeai as genai
 
 
@@ -12,20 +13,34 @@ class LLMAnalyzer:
     def __init__(self, model_name: str = "gemini-2.5-flash"):
         self.model = genai.GenerativeModel(model_name)
 
-    def parse_query(self, user_query: str) -> dict:
+    def parse_query(self, user_query: str, error_context: Optional[str] = None) -> dict:
+        extra = ""
+        if error_context:
+            extra = f"\nError context from log (use this to sharpen intent): {error_context}\n"
         prompt = f"""Return ONLY valid JSON, no markdown, no explanation.
 
 Fields:
 - intent: one of [explain, bug_explanation, usage, optimization, refactor, security, general_question]
 - function_name_candidates: list of function or method names mentioned
 - raw_query: the original query string
-
+{extra}
 User query: "{user_query}"
 """
         response = self.model.generate_content(prompt)
         text = response.text.strip()
-        text = text[text.find("{"):text.rfind("}")+1]
-        return json.loads(text)
+        text = re.sub(r"```json|```", "", text).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end >= start:
+            try:
+                return json.loads(text[start:end+1])
+            except json.JSONDecodeError:
+                pass
+        return {
+            "intent": "bug_explanation",
+            "function_name_candidates": [],
+            "raw_query": user_query
+        }
 
     def analyze_function(
         self,
@@ -36,7 +51,8 @@ User query: "{user_query}"
         retrieved_context: list,
         raw_query: str,
         intent: str,
-        depth: int
+        depth: int,
+        slice_context: Optional[dict] = None,
     ) -> dict:
         """
         Core analysis pass. Returns structured JSON:
@@ -48,12 +64,36 @@ User query: "{user_query}"
         }
         """
 
+        # ── Build optional error context block ────────────────────────────────
+        error_block = ""
+        if slice_context:
+            err_type = slice_context.get("error_type", "")
+            err_msg  = slice_context.get("error_message", "")
+            fail_line = slice_context.get("failing_line", "")
+            slice_stmts = slice_context.get("slice_statements", [])
+            findings_txt = slice_context.get("static_findings", "")
+
+            slice_lines_txt = "\n".join(
+                f"  L{ln}: {txt}" for ln, txt in slice_stmts
+            ) if slice_stmts else "  (no slice statements resolved)"
+
+            error_block = f"""
+ERROR CONTEXT FROM LOG:
+{err_type}: {err_msg}
+
+BACKWARD SLICE (statements relevant to the failure at line {fail_line}):
+{slice_lines_txt}
+
+STATIC FINDINGS ON SLICE VARIABLES:
+{findings_txt or '(none)'}
+"""
+
         prompt = f"""You are a senior software engineer performing deep code analysis.
 
 USER QUERY: {raw_query}
 INTENT: {intent}
 CURRENT DEPTH: {depth}
-
+{error_block}
 FUNCTION BEING ANALYZED: {function_name} in {file_path}
 {function_code}
 
@@ -85,6 +125,7 @@ RULES:
 - check_next should only contain function names actually called inside this function
 - Do NOT return markdown, only raw JSON
 """
+
 
         response = self.model.generate_content(prompt)
         text = response.text.strip()

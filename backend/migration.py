@@ -24,8 +24,8 @@ print(f"Found {total_vectors} vectors in ChromaDB")
 print("Connecting to Qdrant...")
 
 qdrant_client = QdrantClient(
-    url="https://1817678d-d1ec-41a4-af92-1f260fca2718.us-east4-0.gcp.cloud.qdrant.io", 
-    api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6YWE2MzA3NjAtNjZlMi00MDRjLTg0YmUtY2I1NjE4YWEwYTQ5In0.LwNu8GTrH7d8UhSCAwyjEKKh-o2WmJ9VXs4F_AMmFBs",
+    url="https://819d577e-498a-47d2-b4b3-390f58d57f1e.europe-west3-0.gcp.cloud.qdrant.io", 
+    api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6ODQzY2NjMjItMTZjZC00NTg5LWE0MDQtMjQ0MTQ5ZWQ2ZmRjIn0.czfHLwpssCcMBRAd2oZcHDipNUJTD_q8sTbCxPtx1hw",
     timeout=300
 )
 

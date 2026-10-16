@@ -339,6 +339,7 @@ export default function ChatLayout({ branch, maxDepth, onHealthUpdate }: Props) 
   const [repoUrl,   setRepoUrl]   = useState("");
   const [filePath,  setFilePath]  = useState("");
   const [query,     setQuery]     = useState("");
+  const [errorLog,  setErrorLog]  = useState("");   // Stage 4: optional error log
 
   const [phase,     setPhase]     = useState<"idle" | "running" | "done" | "error">("idle");
   const [spinner,   setSpinner]   = useState("");
@@ -380,6 +381,8 @@ export default function ChatLayout({ branch, maxDepth, onHealthUpdate }: Props) 
           branch,
           user_query: query,
           max_depth:  maxDepth,
+          // Stage 4: include error_log only when non-empty
+          ...(errorLog.trim() ? { error_log: errorLog.trim() } : {}),
         }),
       });
 
@@ -521,6 +524,43 @@ export default function ChatLayout({ branch, maxDepth, onHealthUpdate }: Props) 
 
       {/* Query bar */}
       <div className="query-bar">
+        {/* Stage 4: optional error log - collapsible */}
+        <details style={{ marginBottom: "6px" }}>
+          <summary style={{
+            fontSize: "12px",
+            color: "#64748b",
+            cursor: "pointer",
+            userSelect: "none",
+            listStyle: "none",
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+          }}>
+            🪲 Paste error log <span style={{ fontSize: "10px" }}>(optional)</span>
+          </summary>
+          <textarea
+            style={{
+              width: "100%",
+              marginTop: "6px",
+              background: "#0d1117",
+              border: "1px solid #2a2a2e",
+              borderRadius: "6px",
+              color: "#94a3b8",
+              fontSize: "12px",
+              fontFamily: "'JetBrains Mono', monospace",
+              padding: "8px 10px",
+              resize: "vertical",
+              minHeight: "72px",
+              boxSizing: "border-box",
+            }}
+            value={errorLog}
+            onChange={(e) => setErrorLog(e.target.value)}
+            placeholder={"Paste a Python traceback or GCC/Clang error here...\nLeave empty to skip log-guided analysis."}
+            rows={3}
+            disabled={isRunning}
+          />
+        </details>
+
         <div className="query-input-wrap">
           <textarea
             className="query-textarea"

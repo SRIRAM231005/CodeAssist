@@ -1,7 +1,10 @@
 import os
 import requests
 import numpy as np
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient
+
+load_dotenv()
 
 
 HF_EMBEDDING_API = os.getenv("HF_EMBEDDING_API")

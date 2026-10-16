@@ -67,7 +67,8 @@ class DecisionRouter:
         raw_query: str,
         intent: str,
         retrieved_context: list,
-        progress_callback=None
+        progress_callback=None,
+        slice_context: Optional[dict] = None,   # Stage 4: error-log backward slice
     ) -> dict:
         """
         Main traversal loop.
@@ -102,15 +103,15 @@ class DecisionRouter:
 
             # ── STEP 2: Extract function ──────────────────────────────────
             if item.function_name:
-                fn_code = extract_function_node(source, item.function_name)
+                fn_code = extract_function_node(source, item.function_name, item.file_path)
                 if not fn_code:
                     if progress_callback:
                         progress_callback(f"⚠️ Function `{item.function_name}` not found in `{item.file_path}`")
                     continue
             else:
-                fn_code = get_full_context(source, self.raw_query, self.embedder)
+                fn_code = get_full_context(source, raw_query, self.embedder)
 
-            ast_hash = compute_ast_hash(fn_code)
+            ast_hash = compute_ast_hash(fn_code, item.file_path)
 
             # ── STEP 3: Cache check ───────────────────────────────────────
             from_cache = False
@@ -141,6 +142,8 @@ class DecisionRouter:
             if from_cache and cached:
                 llm_result = cached["llm_result"]
             else:
+                # Pass slice_context only for the entry/anchor function (depth 0)
+                _sc = slice_context if item.depth == 0 else None
                 llm_result = self.llm.analyze_function(
                     function_code=fn_code,
                     function_name=item.function_name,
@@ -149,7 +152,8 @@ class DecisionRouter:
                     retrieved_context=retrieved_context,
                     raw_query=raw_query,
                     intent=intent,
-                    depth=item.depth
+                    depth=item.depth,
+                    slice_context=_sc,
                 )
 
                 # Store in Redis cache
@@ -198,15 +202,15 @@ class DecisionRouter:
                 if progress_callback:
                     progress_callback(f"✅ `{item.function_name}` clean — diving into: {check_next}")
 
-                # Resolve dependencies via AST
-                deps = resolve_dependencies(source, item.function_name)
+                # Resolve dependencies via AST / Language Adapter
+                deps = resolve_dependencies(source, item.function_name, item.file_path)
 
                 for fn_name in check_next:
                     if self.graph.is_visited(item.file_path, fn_name):
                         continue
 
                     # Is it a local function?
-                    if fn_name in [f["name"] for f in extract_all_functions(source)]:
+                    if fn_name in [f["name"] for f in extract_all_functions(source, item.file_path)]:
                         queue.append(TraversalItem(
                             file_path=item.file_path,
                             function_name=fn_name,

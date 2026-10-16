@@ -1,24 +1,41 @@
 import os
 import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "New_Model"))
+
+BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
 import json
 import uuid
 import asyncio
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
+from starlette.websockets import WebSocketState
 import google.generativeai as genai
 
 from New_Model.ast_engine import fetch_github_file, extract_all_functions
+from New_Model.chunker import _get_anchor_function
 from New_Model.embedder import CodeEmbedder, QdrantRetriever
 from New_Model.llm_analyzer import LLMAnalyzer
 from New_Model.router import DecisionRouter
 from New_Model.redis_cache import RedisCache
 
+# Diagnostics & slicing – error-log-guided analysis (optional; failures fall back silently)
+try:
+    from New_Model.diagnostics.log_parser import parse_error_log
+    from New_Model.diagnostics.backward_slicer import compute_backward_slice
+    from New_Model.cfg.builder import build_cfg
+    from New_Model.static_analysis.analyzer import run_static_analysis
+    _DIAGNOSTICS_AVAILABLE = True
+except Exception:
+    _DIAGNOSTICS_AVAILABLE = False
+
+load_dotenv(dotenv_path=os.path.join(BACKEND_DIR, ".env"))
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -28,11 +45,13 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "codeassist")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
 REDIS_HOST      = os.getenv("REDIS_HOST", "localhost")
 REDIS_PASSWORD  = os.getenv("REDIS_PASSWORD")
-REDIS_PORT      = int(os.getenv("REDIS_PORT", 6379))
-MAX_DEPTH       = int(os.getenv("MAX_DEPTH", 5))
-TOP_K           = int(os.getenv("TOP_K", 5))
+REDIS_PORT      = int(os.getenv("REDIS_PORT") or 6379)
+REDIS_SSL       = os.getenv("REDIS_SSL", "true" if REDIS_HOST and "upstash.io" in REDIS_HOST else "false").lower() in ("true", "1", "yes")
+MAX_DEPTH       = int(os.getenv("MAX_DEPTH") or 5)
+TOP_K           = int(os.getenv("TOP_K") or 5)
 
-genai.configure(api_key=GEMINI_API_KEY)
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # ── In-memory job store ───────────────────────────────────────────────────────
 # Holds validated job payloads between POST /analyze and WS /ws/{job_id}.
@@ -46,11 +65,11 @@ async def lifespan(app: FastAPI):
     print("[startup] Loading CodeBERT embedder...")
     app.state.embedder = CodeEmbedder()
 
-    print("[startup] Connecting to ChromaDB...")
+    print("[startup] Connecting to Qdrant...")
     app.state.retriever = QdrantRetriever(qdrant_url=QDRANT_URL, qdrant_api_key=QDRANT_API_KEY, collection_name=COLLECTION_NAME, top_k=TOP_K)
 
     print("[startup] Connecting to Redis...")
-    app.state.cache = RedisCache(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, ssl=True)
+    app.state.cache = RedisCache(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, ssl=REDIS_SSL)
 
     print("[startup] Loading LLM (Gemini)...")
     app.state.llm = LLMAnalyzer("gemini-2.5-flash")
@@ -86,19 +105,26 @@ class AnalyzeRequest(BaseModel):
     branch:     str = "main"
     user_query: str
     max_depth:  int = MAX_DEPTH
+    error_log:  Optional[str] = None   # Stage 4: optional error/traceback log
 
     @field_validator("repo_url")
     @classmethod
     def validate_github_url(cls, v: str) -> str:
         if not v.startswith("https://github.com/"):
             raise ValueError("repo_url must be a valid GitHub URL (https://github.com/...)")
-        return v.rstrip("/")
+        v = v.rstrip("/")
+        if v.endswith(".git"):
+            v = v[:-4]
+        return v
 
     @field_validator("file_path")
     @classmethod
     def validate_file_path(cls, v: str) -> str:
-        if not v.endswith(".py"):
-            raise ValueError("Only Python files (.py) are supported at this time.")
+        SUPPORTED_EXTENSIONS = (".py", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp")
+        if not any(v.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+            raise ValueError(
+                f"Only Python (.py) and C/C++ ({', '.join(SUPPORTED_EXTENSIONS)}) files are supported."
+            )
         return v.lstrip("/")
 
     @field_validator("max_depth")
@@ -124,14 +150,59 @@ class AnalyzeResponse(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def filter_function(name_candidates: list[str], fns: list[dict]) -> str | None:
     """Return the best matching function name from extracted AST functions."""
-    lowered = [n.lower() for n in name_candidates]
-    match   = next((fn for fn in fns if fn["name"].lower() in lowered), None)
-    return match["name"] if match else (fns[0]["name"] if fns else None)
+    if not fns or not name_candidates:
+        return None
+
+    cleaned_candidates = []
+    for c in name_candidates:
+        if not isinstance(c, str):
+            continue
+        cleaned = c.strip().rstrip("()").strip()
+        if cleaned.startswith("def "):
+            cleaned = cleaned[4:].strip()
+        if cleaned:
+            cleaned_candidates.append(cleaned.lower())
+
+    if not cleaned_candidates:
+        return None
+
+    # 1. Exact match (case-insensitive)
+    for fn in fns:
+        if fn["name"].lower() in cleaned_candidates:
+            return fn["name"]
+
+    # 2. Match method name in ClassName.method_name
+    for fn in fns:
+        method = fn["name"].split(".")[-1].lower()
+        if method in cleaned_candidates:
+            return fn["name"]
+
+    # 3. Substring match
+    for cand in cleaned_candidates:
+        for fn in fns:
+            fn_lower = fn["name"].lower()
+            if cand in fn_lower or fn_lower in cand:
+                return fn["name"]
+
+    return None
 
 
 async def send(ws: WebSocket, msg_type: str, **kwargs):
-    """Send a typed JSON message over the WebSocket."""
-    await ws.send_text(json.dumps({"type": msg_type, **kwargs}))
+    """Send a typed JSON message over the WebSocket if connected."""
+    try:
+        if ws.client_state == WebSocketState.CONNECTED:
+            await ws.send_text(json.dumps({"type": msg_type, **kwargs}))
+    except Exception:
+        pass
+
+
+async def safe_close(ws: WebSocket, code: int = 1000):
+    """Safely close WebSocket if still connected."""
+    try:
+        if ws.client_state == WebSocketState.CONNECTED:
+            await ws.close(code=code)
+    except Exception:
+        pass
 
 
 # ── POST /analyze ─────────────────────────────────────────────────────────────
@@ -206,10 +277,11 @@ async def analyze_ws(websocket: WebSocket, job_id: str):
     branch     = payload["branch"]
     user_query = payload["user_query"]
     max_depth  = payload["max_depth"]
+    error_log  = payload.get("error_log") or ""   # Stage 4: may be absent/None
 
     # ── Pull shared resources from app state ──────────────────────────────────
     embedder:  CodeEmbedder    = app.state.embedder
-    retriever: ChromaRetriever = app.state.retriever
+    retriever: QdrantRetriever = app.state.retriever
     llm:       LLMAnalyzer     = app.state.llm
     cache:     RedisCache      = app.state.cache
 
@@ -218,58 +290,169 @@ async def analyze_ws(websocket: WebSocket, job_id: str):
         await send(websocket, "spinner", message="Fetching file from GitHub...")
         try:
             source = await asyncio.to_thread(fetch_github_file, repo_url, file_path, branch)
-            fns    = await asyncio.to_thread(extract_all_functions, source)
+            fns    = await asyncio.to_thread(extract_all_functions, source, file_path)
         except Exception as e:
             await send(websocket, "error", detail=f"Failed to fetch file: {str(e)}")
             job["status"] = "failed"
-            await websocket.close()
             return
 
         if not fns:
-            await send(websocket, "error", detail="No Python functions found in the specified file.")
+            await send(websocket, "error", detail="No functions found in the specified file.")
             job["status"] = "failed"
-            await websocket.close()
             return
 
         # ── Step 2: Parse query + identify target function ────────────────────
         await send(websocket, "spinner", message="Understanding your query...")
+
+        # ── Stage 4: attempt error-log-guided anchor resolution ───────────────
+        log_anchor_used  = False   # True when the log successfully set the anchor
+        slice_context: Optional[dict] = None   # filled when backward slice succeeds
+
+        if error_log and _DIAGNOSTICS_AVAILABLE:
+            try:
+                known_files = [fn["file"] for fn in fns if "file" in fn]
+                if not known_files:
+                    known_files = [file_path]
+
+                log_result = parse_error_log(error_log, known_files)
+
+                if log_result is not None:
+                    # Find which function (if any) contains log_result.line
+                    matched_fn = None
+                    for fn in fns:
+                        span = fn.get("span") or fn.get("location")
+                        if span and isinstance(span, (list, tuple)) and len(span) >= 2:
+                            start_ln, end_ln = int(span[0]), int(span[1])
+                            if start_ln <= log_result.line <= end_ln:
+                                matched_fn = fn["name"]
+                                break
+
+                    if matched_fn:
+                        function_name = matched_fn
+                        log_anchor_used = True
+                        await send(websocket, "spinner",
+                                   message=f"[log] Anchor from error log: {function_name} "
+                                           f"(line {log_result.line})")
+
+                        # Attempt backward slice for this function
+                        try:
+                            # Find the function's source code from fns
+                            fn_rec = next((f for f in fns if f["name"] == function_name), None)
+                            fn_code = fn_rec.get("code", "") if fn_rec else ""
+
+                            cfg = build_cfg(fn_code, file_path, function_name)
+                            if cfg is not None:
+                                from New_Model.static_analysis.reaching_defs import ReachingDefinitionsAnalyzer
+                                from New_Model.static_analysis.liveness import LivenessAnalyzer
+                                rda = ReachingDefinitionsAnalyzer(cfg)
+                                rda.analyze()
+
+                                slice_res = compute_backward_slice(
+                                    cfg,
+                                    rda.def_use_chains,
+                                    log_result.line,
+                                )
+
+                                # Collect static findings that touch variables in slice
+                                lva = LivenessAnalyzer(cfg)
+                                _, _, lva_findings = lva.analyze()
+                                slice_var_names: set = set()
+                                for _, txt in slice_res.slice_statements:
+                                    import re as _re
+                                    slice_var_names.update(_re.findall(r'\b([A-Za-z_]\w*)\b', txt))
+
+                                relevant_findings = [
+                                    f.message for f in lva_findings
+                                    if any(v in f.message for v in slice_var_names)
+                                ] if slice_var_names else []
+
+                                slice_context = {
+                                    "error_type":     log_result.error_type,
+                                    "error_message":  log_result.error_message,
+                                    "failing_line":   log_result.line,
+                                    "slice_statements": slice_res.slice_statements,
+                                    "static_findings": "\n".join(relevant_findings),
+                                }
+                        except Exception as _slice_err:
+                            print(f"[ws] Stage4 slice failed (non-fatal): {_slice_err}")
+                            slice_context = {
+                                "error_type":    log_result.error_type,
+                                "error_message": log_result.error_message,
+                                "failing_line":  log_result.line,
+                                "slice_statements": [],
+                                "static_findings": "",
+                            }
+
+            except Exception as _log_err:
+                print(f"[ws] Stage4 log parse failed (non-fatal): {_log_err}")
+
+        # Build error_context hint for parse_query (error type + message, when available)
+        error_context_hint: Optional[str] = None
+        if slice_context:
+            error_context_hint = f"{slice_context['error_type']}: {slice_context['error_message']}"
+
+        parsed = {}
         try:
-            parsed          = await asyncio.to_thread(llm.parse_query, user_query)
-            name_candidates = parsed.get("function_name_candidates", [])
-            if(name_candidates):
-                function_name   = filter_function(name_candidates, fns)
-            else:
-                function_name
-            intent = parsed.get("intent")
+            parsed = await asyncio.to_thread(llm.parse_query, user_query, error_context_hint)
         except Exception as e:
-            await send(websocket, "error", detail=f"Query parsing failed: {str(e)}")
-            job["status"] = "failed"
-            await websocket.close()
-            return
+            print(f"[ws] Warning: llm.parse_query failed ({e}), using fallback")
+
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        intent = parsed.get("intent") or "bug_explanation"
+
+        # Only run LLM name extraction + CodeBERT anchor when log did NOT set one
+        if not log_anchor_used:
+            raw_candidates = parsed.get("function_name_candidates", [])
+            if isinstance(raw_candidates, str):
+                name_candidates = [raw_candidates]
+            elif isinstance(raw_candidates, list):
+                name_candidates = [str(c) for c in raw_candidates if c]
+            else:
+                name_candidates = []
+
+            # 1. Match against extracted functions using candidates
+            function_name = filter_function(name_candidates, fns)
+
+            # 2. If not matched, use semantic similarity (CodeBERT anchor function)
+            if not function_name and embedder:
+                try:
+                    anchor = await asyncio.to_thread(_get_anchor_function, fns, user_query, embedder)
+                    if anchor and "name" in anchor:
+                        function_name = anchor["name"]
+                except Exception as e:
+                    print(f"[ws] Warning: Semantic anchor function search failed: {e}")
+
+            # 3. Final fallback: default to the first function in the file
+            if not function_name and fns:
+                function_name = fns[0]["name"]
 
         await send(websocket, "spinner", message=f"Target function identified: {function_name}")
 
-        # ── Step 3: ChromaDB similarity search ───────────────────────────────
+        # ── Step 3: Qdrant similarity search ─────────────────────────────────
         await send(websocket, "spinner", message="Searching knowledge base...")
+        retrieved_context = []
         try:
             query_embedding   = await asyncio.to_thread(embedder.embed, user_query)
             retrieved_context = await asyncio.to_thread(retriever.retrieve, query_embedding)
         except Exception as e:
-            await send(websocket, "error", detail=f"Knowledge base search failed: {str(e)}")
-            job["status"] = "failed"
-            await websocket.close()
-            return
+            print(f"[ws] Warning: Knowledge base search failed: {e}")
+            # Non-fatal: analysis can proceed with AST and LLM reasoning
 
         # ── Step 4: Deep traversal + LLM analysis ────────────────────────────
         await send(websocket, "spinner", message="Running deep analysis...")
 
         # Bridge sync progress_callback → async WebSocket via a queue
-        loop      = asyncio.get_event_loop()
+        loop      = asyncio.get_running_loop()
         log_queue: asyncio.Queue = asyncio.Queue()
 
         def progress_callback(message: str):
             """Called synchronously by DecisionRouter; pushes into async queue."""
-            loop.call_soon_threadsafe(log_queue.put_nowait, message)
+            try:
+                loop.call_soon_threadsafe(log_queue.put_nowait, message)
+            except RuntimeError:
+                pass
 
         router = DecisionRouter(
             repo_url=repo_url,
@@ -291,6 +474,7 @@ async def analyze_ws(websocket: WebSocket, job_id: str):
                 intent=intent,
                 retrieved_context=retrieved_context,
                 progress_callback=progress_callback,
+                slice_context=slice_context,    # Stage 4: may be None
             )
         )
 
@@ -302,9 +486,14 @@ async def analyze_ws(websocket: WebSocket, job_id: str):
                     await send(websocket, "log", message=message)
                 except asyncio.TimeoutError:
                     continue
+                except Exception:
+                    break
             # Flush any remaining messages after task completes
             while not log_queue.empty():
-                await send(websocket, "log", message=log_queue.get_nowait())
+                try:
+                    await send(websocket, "log", message=log_queue.get_nowait())
+                except Exception:
+                    break
 
         await asyncio.gather(analysis_task, drain_logs())
         result = analysis_task.result()
@@ -335,23 +524,20 @@ async def analyze_ws(websocket: WebSocket, job_id: str):
     finally:
         # Remove job from store — to persist results, write to Redis here instead
         job_store.pop(job_id, None)
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        await safe_close(websocket)
 
 
 # ── GET /health ───────────────────────────────────────────────────────────────
 @app.get("/health", summary="System health check")
 async def health():
     """Returns status of all backend services: Redis, embedder, retriever, LLM."""
-    cache: RedisCache = app.state.cache
-    stats = cache.get_stats()
+    cache: RedisCache | None = getattr(app.state, "cache", None)
+    stats = cache.get_stats() if cache else {"status": "unavailable"}
     return {
         "redis":     stats,
-        "embedder":  "loaded" if app.state.embedder  else "unavailable",
-        "retriever": "loaded" if app.state.retriever else "unavailable",
-        "llm":       "loaded" if app.state.llm       else "unavailable",
+        "embedder":  "loaded" if getattr(app.state, "embedder", None)  else "unavailable",
+        "retriever": "loaded" if getattr(app.state, "retriever", None) else "unavailable",
+        "llm":       "loaded" if getattr(app.state, "llm", None)       else "unavailable",
     }
 
 
@@ -359,7 +545,9 @@ async def health():
 @app.get("/cache/stats", summary="Redis cache statistics")
 async def cache_stats():
     """Returns number of cached nodes in Redis."""
-    cache: RedisCache = app.state.cache
+    cache: RedisCache | None = getattr(app.state, "cache", None)
+    if not cache:
+        return {"status": "unavailable"}
     return cache.get_stats()
 
 
@@ -367,16 +555,16 @@ async def cache_stats():
 @app.post("/cache/clear", summary="Clear Redis cache")
 async def cache_clear():
     """Flushes all keys under the codeassist:* namespace from Redis."""
-    cache: RedisCache = app.state.cache
+    cache: RedisCache | None = getattr(app.state, "cache", None)
 
-    if not cache.available:
+    if not cache or not cache.available:
         raise HTTPException(
             status_code=503,
             detail="Redis is not available. Cannot clear cache.",
         )
 
     keys = cache.client.keys("codeassist:*")
-    for k in keys:
-        cache.client.delete(k)
+    if keys:
+        cache.client.delete(*keys)
 
     return {"deleted_keys": len(keys), "message": f"Cleared {len(keys)} cached nodes."}
